@@ -1,0 +1,416 @@
+name: AI Server 24x7
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  MODEL: ${{ vars.MODEL || 'huihui_ai/qwen2.5-abliterate:7b' }}
+  HANDOVER_MIN: 320
+  DEADLINE_MIN: 348
+  SYNC_INTERVAL: 1
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.chk.outputs.go }}
+    steps:
+      - id: chk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ vars.AI_ENABLED }}" = "false" ]; then echo "go=false" >> $GITHUB_OUTPUT; exit 0; fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            n=0
+            for s in in_progress queued; do
+              c=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ai-server.yml --status $s --json databaseId -q "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+              n=$((n + c))
+            done
+            if [ "$n" -gt 0 ]; then echo "go=false" >> $GITHUB_OUTPUT; exit 0; fi
+          fi
+          echo "go=true" >> $GITHUB_OUTPUT
+
+  serve:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      CF_HOSTNAME: ${{ vars.CF_HOSTNAME }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_STARTED_AT: ${{ github.run_started_at }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Model slug
+        id: slug
+        run: echo "v=$(echo "$MODEL" | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache model
+        uses: actions/cache@v4
+        with:
+          path: ~/ollama-models
+          key: ollama-models-${{ steps.slug.outputs.v }}
+
+      - name: Install tools
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd jq unzip
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo systemctl disable ollama 2>/dev/null || true
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          rclone lsd gdrive: > /dev/null && echo "Drive OK"
+
+      - name: Write app files
+        run: |
+          mkdir -p ~/app
+          cd ~/app
+
+          cat > server.js <<'EOF'
+          const http = require('http'), fs = require('fs'), path = require('path');
+          const { StringDecoder } = require('string_decoder');
+          const PORT = 3000, OH = '127.0.0.1', OP = 11434;
+          const MODEL = process.env.MODEL, PASS = process.env.APP_PASSWORD || '';
+          const DATA = process.env.LIVE, RUN = process.env.RUN_ID || '0';
+          const LOG = path.join(DATA, 'chat_' + RUN + '.jsonl');
+          const safe = s => String(s || 'x').replace(/[^\w-]/g, '').slice(0, 40);
+
+          function authed(req) {
+            if (!PASS) return false;
+            const h = req.headers;
+            let tok = h['x-api-key'] || '';
+            const a = h['authorization'] || '';
+            if (a.startsWith('Bearer ')) tok = a.slice(7);
+            if (a.startsWith('Basic ')) { const d = Buffer.from(a.slice(6), 'base64').toString(); tok = d.slice(d.indexOf(':') + 1); }
+            return tok === PASS;
+          }
+          function body(req) { return new Promise(r => { let b = ''; req.on('data', c => b += c); req.on('end', () => r(b)); }); }
+          function logLine(o) { fs.appendFile(LOG, JSON.stringify(o) + '\n', () => {}); }
+
+          function history() {
+            const recs = [], inflight = [];
+            for (const f of fs.readdirSync(DATA)) {
+              try {
+                const txt = fs.readFileSync(path.join(DATA, f), 'utf8');
+                if (f.startsWith('chat_')) txt.split('\n').forEach(l => { if (l) try { recs.push(JSON.parse(l)); } catch (e) {} });
+                else if (f.startsWith('inflight_')) inflight.push(JSON.parse(txt));
+              } catch (e) {}
+            }
+            for (const p of inflight) {
+              const done = recs.some(r => r.cid === p.cid && r.role === 'assistant' && r.t >= p.t);
+              if (!done && p.content) recs.push(p);
+            }
+            recs.sort((a, b) => a.t - b.t);
+            const m = {};
+            for (const r of recs) {
+              const c = m[r.cid] = m[r.cid] || { cid: r.cid, t: r.t, messages: [] };
+              c.messages.push({ role: r.role, content: r.content }); c.t = r.t;
+            }
+            return Object.values(m).sort((a, b) => b.t - a.t);
+          }
+
+          async function chat(req, res) {
+            let j;
+            try { j = JSON.parse(await body(req)); } catch (e) { res.writeHead(400); return res.end('bad json'); }
+            const cid = safe(j.cid), msgs = j.messages || [];
+            const last = msgs[msgs.length - 1];
+            if (last && last.role === 'user') logLine({ t: Date.now(), cid, role: 'user', content: last.content });
+            const payload = JSON.stringify({ model: MODEL, messages: msgs, stream: true, keep_alive: -1, options: { num_ctx: 4096 } });
+            const inf = path.join(DATA, 'inflight_' + RUN + '_' + cid + '.json');
+            let full = '', buf = '', fin = false;
+            const dec = new StringDecoder('utf8');
+            const tick = setInterval(() => fs.writeFile(inf, JSON.stringify({ t: Date.now(), cid, role: 'assistant', content: full }), () => {}), 1000);
+            const finish = () => {
+              if (fin) return; fin = true; clearInterval(tick);
+              if (full) logLine({ t: Date.now(), cid, role: 'assistant', content: full });
+              setTimeout(() => fs.unlink(inf, () => {}), 100);
+            };
+            const up = http.request({ host: OH, port: OP, path: '/api/chat', method: 'POST',
+              headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } }, r => {
+              res.writeHead(r.statusCode, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-cache' });
+              r.on('data', c => {
+                res.write(c); buf += dec.write(c);
+                let i;
+                while ((i = buf.indexOf('\n')) >= 0) {
+                  const l = buf.slice(0, i); buf = buf.slice(i + 1);
+                  try { const o = JSON.parse(l); if (o.message && o.message.content) full += o.message.content; } catch (e) {}
+                }
+              });
+              r.on('end', () => { finish(); res.end(); });
+            });
+            up.on('error', e => { finish(); if (!res.headersSent) res.writeHead(502); res.end(JSON.stringify({ error: String(e) })); });
+            res.on('close', () => { finish(); up.destroy(); });
+            up.end(payload);
+          }
+
+          function proxy(req, res) {
+            const h = Object.assign({}, req.headers);
+            h.host = OH + ':' + OP; delete h['accept-encoding']; delete h.origin;
+            const up = http.request({ host: OH, port: OP, path: req.url, method: req.method, headers: h }, r => {
+              res.writeHead(r.statusCode, r.headers); r.pipe(res);
+            });
+            up.on('error', e => { if (!res.headersSent) res.writeHead(502); res.end(String(e)); });
+            req.pipe(up);
+          }
+
+          const HTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+          const PS = fs.readFileSync(path.join(__dirname, 'cli.ps1'), 'utf8');
+
+          http.createServer(async (req, res) => {
+            const u = req.url.split('?')[0];
+            if (u === '/healthz') { res.writeHead(200); return res.end('ok'); }
+            if (u === '/cli.ps1') {
+              const base = (req.headers['x-forwarded-proto'] || 'https').split(',')[0] + '://' + req.headers.host;
+              res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+              return res.end(PS.replace('__BASE__', base));
+            }
+            if (!authed(req)) { res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="AI"' }); return res.end('Login required'); }
+            if (u === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(HTML); }
+            if (u === '/api/info') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ model: MODEL })); }
+            if (u === '/api/history') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(history())); }
+            if (u === '/api/chat' && req.method === 'POST') return chat(req, res);
+            if (u.startsWith('/v1/') || u.startsWith('/api/')) return proxy(req, res);
+            res.writeHead(404); res.end('not found');
+          }).listen(PORT, '127.0.0.1');
+          EOF
+
+          cat > index.html <<'EOF'
+          <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>My AI</title>
+          <style>
+          *{box-sizing:border-box}body{margin:0;font:15px system-ui,sans-serif;background:#0f1115;color:#e6e6e6;display:flex;height:100vh}
+          #side{width:250px;background:#171a21;padding:10px;overflow:auto;display:flex;flex-direction:column;gap:6px}
+          #side button{background:#232836;color:#ddd;border:0;border-radius:8px;padding:9px;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          #side button:hover{background:#2d3446}
+          #main{flex:1;display:flex;flex-direction:column;min-width:0}
+          #chat{flex:1;overflow:auto;padding:16px}
+          .m{max-width:800px;margin:0 auto 14px;padding:10px 14px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
+          .user{background:#2a3350}.assistant{background:#1c212c}
+          #bar{display:flex;gap:8px;padding:12px;max-width:840px;width:100%;margin:0 auto}
+          textarea{flex:1;background:#1c212c;color:#eee;border:1px solid #333;border-radius:10px;padding:10px;resize:none;font:inherit}
+          #bar button,#box button{background:#4a6cf7;color:#fff;border:0;border-radius:10px;padding:8px 18px;cursor:pointer}
+          #modal{display:none;position:fixed;inset:0;background:#000a;align-items:center;justify-content:center}
+          #box{background:#171a21;padding:20px;border-radius:12px;max-width:760px;width:92%;max-height:90vh;overflow:auto}
+          pre{background:#0b0d11;padding:10px;border-radius:8px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+          @media(max-width:700px){#side{display:none}}
+          </style></head><body>
+          <div id="side"><button onclick="newChat()">+ New chat</button><button onclick="showCli()">💻 CMD / Terminal</button><hr style="width:100%;border-color:#333"><div id="list" style="display:flex;flex-direction:column;gap:6px"></div></div>
+          <div id="main"><div id="chat"></div><div id="bar"><textarea id="q" rows="2" placeholder="Message... (Enter = send, Shift+Enter = new line)"></textarea><button id="go" onclick="send()">Send</button></div></div>
+          <div id="modal" onclick="if(event.target==this)this.style.display='none'"><div id="box"></div></div>
+          <script>
+          const $ = id => document.getElementById(id);
+          function nid(){return 'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6)}
+          let cid = localStorage.cid || nid(), msgs = [], convs = [];
+          function add(role, text){const d=document.createElement('div');d.className='m '+role;d.textContent=text;$('chat').appendChild(d);$('chat').scrollTop=1e9;return d}
+          function render(){$('chat').innerHTML='';msgs.forEach(m=>add(m.role,m.content))}
+          function newChat(){cid=nid();localStorage.cid=cid;msgs=[];render()}
+          async function loadHist(){
+            try{convs=await (await fetch('/api/history')).json()}catch(e){}
+            $('list').innerHTML='';
+            convs.forEach(c=>{const b=document.createElement('button');const f=c.messages.find(m=>m.role==='user');
+              b.textContent=(f?f.content:c.cid).slice(0,40);
+              b.onclick=()=>{cid=c.cid;localStorage.cid=cid;msgs=c.messages.slice();render()};
+              $('list').appendChild(b)})
+          }
+          async function send(){
+            const t=$('q').value.trim(); if(!t) return; $('q').value=''; $('go').disabled=true;
+            msgs.push({role:'user',content:t}); add('user',t); const d=add('assistant','…'); let full='';
+            try{
+              const r=await fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cid,messages:msgs})});
+              const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+              while(true){
+                const {done,value}=await rd.read(); if(done)break; buf+=dec.decode(value,{stream:true}); let i;
+                while((i=buf.indexOf('\n'))>=0){
+                  const l=buf.slice(0,i); buf=buf.slice(i+1);
+                  try{const o=JSON.parse(l); if(o.message&&o.message.content){full+=o.message.content;d.textContent=full;$('chat').scrollTop=1e9}}catch(e){}
+                }
+              }
+            }catch(e){d.textContent=full+'\n[error: '+e+']'}
+            msgs.push({role:'assistant',content:full}); $('go').disabled=false; loadHist();
+          }
+          $('q').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+          function cp(id){navigator.clipboard.writeText($(id).textContent)}
+          async function showCli(){
+            const o=location.origin, info=await (await fetch('/api/info')).json();
+            const c1='powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm \''+o+'/cli.ps1\')"';
+            const c2='set ANTHROPIC_BASE_URL='+o+'\nset ANTHROPIC_AUTH_TOKEN=YOUR_APP_PASSWORD\nset ANTHROPIC_API_KEY=\nset ANTHROPIC_MODEL='+info.model+'\nclaude';
+            $('box').innerHTML='<h3>1) Windows CMD me chat</h3><p>CMD ya PowerShell me paste karo (password puchega):</p><pre id="c1"></pre><button onclick="cp(\'c1\')">Copy</button>'
+              +'<h3>2) Claude Code CLI (is model ke saath)</h3><p>CMD me paste karo, YOUR_APP_PASSWORD ki jagah apna password likho:</p><pre id="c2"></pre><button onclick="cp(\'c2\')">Copy</button>';
+            $('c1').textContent=c1; $('c2').textContent=c2; $('modal').style.display='flex';
+          }
+          loadHist().then(()=>{const c=convs.find(x=>x.cid===cid); if(c){msgs=c.messages.slice();render()}});
+          </script></body></html>
+          EOF
+
+          cat > cli.ps1 <<'EOF'
+          $base = "__BASE__"
+          Add-Type -AssemblyName System.Net.Http
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $sec = Read-Host "Password" -AsSecureString
+          $pw = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+          $client = New-Object System.Net.Http.HttpClient
+          $client.Timeout = [TimeSpan]::FromMinutes(30)
+          $client.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $pw)
+          try { $info = Invoke-RestMethod -Uri "$base/api/info" -Headers @{Authorization = "Bearer $pw"} }
+          catch { Write-Host "Login failed ya server band hai." -ForegroundColor Red; return }
+          $cid = "cli-" + [guid]::NewGuid().ToString("N").Substring(0,8)
+          $msgs = New-Object System.Collections.ArrayList
+          Write-Host "Model: $($info.model)   (/new = new chat, /exit = quit)" -ForegroundColor Cyan
+          while ($true) {
+            $q = Read-Host "`nYou"
+            if ($q -eq "/exit") { break }
+            if ($q -eq "/new") { $msgs.Clear(); continue }
+            if (-not $q) { continue }
+            [void]$msgs.Add(@{role = "user"; content = $q})
+            $body = @{cid = $cid; messages = $msgs} | ConvertTo-Json -Depth 6
+            $req = New-Object System.Net.Http.HttpRequestMessage("POST", "$base/api/chat")
+            $req.Content = New-Object System.Net.Http.StringContent($body, [Text.Encoding]::UTF8, "application/json")
+            $resp = $client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+            $sr = New-Object IO.StreamReader($resp.Content.ReadAsStreamAsync().Result, [Text.Encoding]::UTF8)
+            $full = ""
+            Write-Host "AI: " -NoNewline -ForegroundColor Green
+            while (-not $sr.EndOfStream) {
+              $line = $sr.ReadLine()
+              if (-not $line) { continue }
+              try { $j = $line | ConvertFrom-Json; $t = $j.message.content; if ($t) { Write-Host $t -NoNewline; $full += $t } } catch {}
+            }
+            Write-Host ""
+            [void]$msgs.Add(@{role = "assistant"; content = $full})
+          }
+          EOF
+
+          cat > backup.sh <<'EOF'
+          #!/usr/bin/env bash
+          TYPE="${1:-manual}"; LIVE="${LIVE:-$HOME/data/live}"
+          TS=$(date -u +%Y%m%d_%H%M%S); tmp=$(mktemp -d)
+          rclone copy "$LIVE" gdrive:AIChat/live --update -q
+          tar -czf "$tmp/b.tgz" -C "$(dirname "$LIVE")" "$(basename "$LIVE")"
+          rclone copyto "$tmp/b.tgz" "gdrive:AIChat/backups/${TYPE}_run${RUN_ID}_${TS}.tar.gz"
+          rclone copyto "$tmp/b.tgz" "gdrive:AIChat/backups/LATEST_${TYPE}.tar.gz"
+          rclone delete gdrive:AIChat/backups --min-age 14d --include "*_run*" -q 2>/dev/null
+          echo "backup '$TYPE' uploaded"
+          EOF
+
+          cat > restore.sh <<'EOF'
+          #!/usr/bin/env bash
+          LIVE="$HOME/data/live"; mkdir -p "$LIVE" "$HOME/restore"
+          rclone copy gdrive:AIChat/live "$LIVE" --update && echo "live data restored"
+          for t in timeout error; do
+            if rclone copyto "gdrive:AIChat/backups/LATEST_${t}.tar.gz" "$HOME/restore/$t.tgz" 2>/dev/null; then
+              mkdir -p "$HOME/restore/$t" && tar -xzf "$HOME/restore/$t.tgz" -C "$HOME/restore/$t"
+              cp -n "$HOME/restore/$t/live/"* "$LIVE/" 2>/dev/null
+              echo "merged backup: $t"
+            fi
+          done
+          ls -la "$LIVE"
+          EOF
+
+          cat > sync.sh <<'EOF'
+          #!/usr/bin/env bash
+          LIVE="${LIVE:-$HOME/data/live}"; i=0
+          while true; do
+            rclone copy "$LIVE" gdrive:AIChat/live --update --transfers 4 -q
+            i=$((i+1))
+            if [ $((i % 10)) -eq 0 ]; then
+              rclone copy gdrive:AIChat/live "$LIVE" --update --exclude "*${RUN_ID}*" -q
+            fi
+            sleep "${SYNC_INTERVAL:-1}"
+          done
+          EOF
+
+          cat > run.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          export APP="$HOME/app" LIVE="$HOME/data/live" PORT=3000
+          export OLLAMA_MODELS="$HOME/ollama-models" OLLAMA_HOST=127.0.0.1:11434 OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1
+          mkdir -p "$LIVE" "$OLLAMA_MODELS"
+          START=$(date -d "$RUN_STARTED_AT" +%s)
+          HANDOVER=$((START + HANDOVER_MIN * 60)); DEADLINE=$((START + DEADLINE_MIN * 60))
+          URL=""
+
+          start_ollama() {
+            pkill -x ollama 2>/dev/null; sleep 1
+            nohup ollama serve > "$HOME/ollama.log" 2>&1 &
+            for i in $(seq 1 60); do curl -sf http://127.0.0.1:11434/api/tags > /dev/null && return 0; sleep 1; done
+            return 1
+          }
+          start_server() { pkill -f "$APP/server.js" 2>/dev/null; nohup node "$APP/server.js" > "$HOME/server.log" 2>&1 & sleep 1; }
+          start_tunnel() {
+            pkill -x cloudflared 2>/dev/null; sleep 1; : > "$HOME/cf.log"
+            if [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_HOSTNAME:-}" ]; then
+              nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" > "$HOME/cf.log" 2>&1 &
+              URL="https://$CF_HOSTNAME"
+            else
+              nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3000 > "$HOME/cf.log" 2>&1 &
+              URL=""
+              for i in $(seq 1 60); do
+                URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' "$HOME/cf.log" | grep -v '^https://api\.' | head -1)
+                [ -n "$URL" ] && break; sleep 1
+              done
+            fi
+          }
+          publish_url() {
+            [ -z "$URL" ] && return
+            echo "SITE URL: $URL"; echo "### AI site: $URL" >> "$GITHUB_STEP_SUMMARY"
+            d=$(mktemp -d); echo "$URL" > "$d/url.txt"
+            rclone copyto "$d/url.txt" gdrive:AIChat/current_url.txt -q
+            ( cd "$d" && git init -q -b status && git add url.txt \
+              && git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm url \
+              && git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" status ) || echo "status push failed"
+          }
+
+          nohup bash "$APP/sync.sh" > "$HOME/sync.log" 2>&1 &
+          start_ollama || { echo "ollama start failed"; cat "$HOME/ollama.log"; exit 1; }
+          ollama pull "$MODEL" || exit 1
+          curl -s http://127.0.0.1:11434/api/generate -d "{\"model\":\"$MODEL\",\"keep_alive\":-1}" > /dev/null &
+          start_server
+          start_tunnel; publish_url
+
+          HANDED=0; HBACK=0
+          while :; do
+            now=$(date +%s)
+            [ "$now" -ge "$DEADLINE" ] && break
+            if [ "$now" -ge "$HANDOVER" ]; then
+              if [ "$HBACK" = 0 ]; then bash "$APP/backup.sh" timeout; HBACK=1; fi
+              if [ "$HANDED" = 0 ]; then
+                gh workflow run ai-server.yml --ref "$REF_NAME" && { HANDED=1; echo "next run triggered"; }
+              fi
+            fi
+            curl -sf http://127.0.0.1:11434/api/tags > /dev/null || { echo "ollama down, restarting"; start_ollama; }
+            curl -sf http://127.0.0.1:3000/healthz > /dev/null || { echo "server down, restarting"; start_server; }
+            pgrep -x cloudflared > /dev/null || { echo "tunnel down, restarting"; start_tunnel; publish_url; }
+            sleep 10
+          done
+
+          echo "deadline reached: final backup"
+          [ "$HANDED" = 0 ] && gh workflow run ai-server.yml --ref "$REF_NAME"
+          bash "$APP/backup.sh" timeout
+          pkill -f sync.sh 2>/dev/null
+          exit 0
+          EOF
+          chmod +x *.sh
+
+      - name: Restore data from Drive
+        run: bash ~/app/restore.sh
+
+      - name: Run (serve + supervise + handover)
+        run: bash ~/app/run.sh
+
+      - name: Emergency backup (on error / cancel / timeout)
+        if: failure() || cancelled()
+        run: bash ~/app/backup.sh error
